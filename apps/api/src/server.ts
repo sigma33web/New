@@ -14,19 +14,29 @@
 import { randomUUID } from 'node:crypto';
 import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
 import {
+  budgetReport,
+  BUDGET_SCOPE_KINDS,
   COST_DIMENSIONS,
   costSummary,
   createSession,
+  embeddingSetReport,
   entitiesOfType,
+  gcEligible,
   isTerminalStatus,
   jobControlOf,
   jobEventsAfter,
+  leaseOccupancy,
   listCommits,
   manuscriptVersionsOf,
   needsAttention,
+  OPERATION_CLASSES,
+  rateLimitStatus as operatorRateLimitStatus,
+  queryString,
   readiness,
   requestJobControl,
+  retrievalDiagnostics,
   revokeSession,
+  thesaurusListing,
   timelinesOf,
   verifyPassword,
   workspacesOf,
@@ -59,6 +69,7 @@ import {
 } from './export.js';
 import { requireVerb } from './verbs.js';
 import { registerResourceRoutes } from './resource-routes.js';
+import { contentHashOf } from '@yeonjae/prose';
 import {
   correct as correctCanonOp,
   correctionView,
@@ -1311,6 +1322,137 @@ export function buildApi(options: ApiOptions): FastifyInstance {
     await inScope(pool, scope, async (c) => projectOr404(c, projectId));
     const status = await workflowStatus(pool, workflowIdFor(projectId, chapterNo));
     return status;
+  });
+
+  // ---- operator diagnostics and controls (Workstream A) ---------------------------------------------
+  //
+  // These routes are a thin adapter over `operator.ts`, which is the SAME application layer the
+  // `operator:*` CLI commands call. Keeping one layer under both surfaces is what stops the CLI and the
+  // API from answering the same operational question differently.
+  //
+  // Role policy, applied uniformly below:
+  //   * a diagnostic is a READ and requires `viewer`;
+  //   * embedding-set activation and rollback change what every subsequent retrieval reads, and the
+  //     thesaurus mutations change how queries resolve, so all of them require `owner` and are AUDITED.
+  //
+  // Scope never comes from the payload. Every route derives the workspace from the authenticated
+  // principal and resolves the project through `projectOr404` inside the RLS scope FIRST, so a project id
+  // from another workspace is a 404 before any service sees it.
+
+  app.get('/v1/operator/rate-limits', async (req) => {
+    const scope = await scoped(pool, req);
+    requireRole(scope, 'viewer');
+    const query = req.query as Record<string, unknown>;
+    const operationClass = requireEnum(
+      (query.operation_class as string | undefined) ?? 'provider_call',
+      OPERATION_CLASSES,
+      'query.operation_class',
+    );
+    const projectId = queryString(query.project_id)
+      ? requireUuid(queryString(query.project_id), 'query.project_id')
+      : undefined;
+    return inScope(pool, scope, async (c) => {
+      if (projectId) await projectOr404(c, projectId);
+      return operatorRateLimitStatus(c, {
+        workspaceId: scope.workspaceId,
+        projectId,
+        operationClass,
+      });
+    });
+  });
+
+  app.get('/v1/operator/leases', async (req) => {
+    const scope = await scoped(pool, req);
+    requireRole(scope, 'viewer');
+    const query = req.query as Record<string, unknown>;
+    const projectId = queryString(query.project_id)
+      ? requireUuid(queryString(query.project_id), 'query.project_id')
+      : undefined;
+    return inScope(pool, scope, async (c) => {
+      if (projectId) await projectOr404(c, projectId);
+      return leaseOccupancy(c, { projectId, limit: query.limit });
+    });
+  });
+
+  app.get('/v1/operator/budgets', async (req) => {
+    const scope = await scoped(pool, req);
+    requireRole(scope, 'viewer');
+    const query = req.query as Record<string, unknown>;
+    const scopeKind = requireEnum(
+      (query.scope_kind as string | undefined) ?? 'workspace',
+      BUDGET_SCOPE_KINDS,
+      'query.scope_kind',
+    );
+    // A workspace-scoped budget is ALWAYS the caller's own workspace, taken from the auth context. A
+    // project-scoped one must name a project that is visible in that scope. Neither accepts an arbitrary
+    // scope id from the query, which is what stops this route from reading another tenant's budget.
+    return inScope(pool, scope, async (c) => {
+      if (scopeKind === 'workspace')
+        return budgetReport(c, { scopeKind, scopeId: scope.workspaceId });
+      const projectId = requireUuid(queryString(query.project_id), 'query.project_id');
+      await projectOr404(c, projectId);
+      return budgetReport(c, { scopeKind: 'project', scopeId: projectId });
+    });
+  });
+
+  app.get('/v1/projects/:projectId/operator/embedding-set', async (req) => {
+    const scope = await scoped(pool, req);
+    requireRole(scope, 'viewer');
+    const projectId = requireUuid(
+      (req.params as { projectId?: string }).projectId,
+      'params.projectId',
+    );
+    return inScope(pool, scope, async (c) => {
+      await projectOr404(c, projectId);
+      return embeddingSetReport(c, { projectId, hashOf: contentHashOf });
+    });
+  });
+
+  app.get('/v1/projects/:projectId/operator/embedding-sets/gc-eligible', async (req) => {
+    const scope = await scoped(pool, req);
+    requireRole(scope, 'viewer');
+    const projectId = requireUuid(
+      (req.params as { projectId?: string }).projectId,
+      'params.projectId',
+    );
+    const query = req.query as Record<string, unknown>;
+    return inScope(pool, scope, async (c) => {
+      await projectOr404(c, projectId);
+      return gcEligible(c, { projectId, keep: Number(query.keep ?? 1), limit: query.limit });
+    });
+  });
+
+  app.get('/v1/projects/:projectId/operator/thesaurus', async (req) => {
+    const scope = await scoped(pool, req);
+    requireRole(scope, 'viewer');
+    const projectId = requireUuid(
+      (req.params as { projectId?: string }).projectId,
+      'params.projectId',
+    );
+    const query = req.query as Record<string, unknown>;
+    return inScope(pool, scope, async (c) => {
+      await projectOr404(c, projectId);
+      return thesaurusListing(c, {
+        projectId,
+        limit: query.limit,
+        includeInactive: query.include_inactive === 'true',
+      });
+    });
+  });
+
+  app.get('/v1/projects/:projectId/operator/retrieval', async (req) => {
+    const scope = await scoped(pool, req);
+    requireRole(scope, 'viewer');
+    const projectId = requireUuid(
+      (req.params as { projectId?: string }).projectId,
+      'params.projectId',
+    );
+    const query = req.query as Record<string, unknown>;
+    const q = requireString(query, 'q', { max: 500 });
+    return inScope(pool, scope, async (c) => {
+      await projectOr404(c, projectId);
+      return retrievalDiagnostics(c, { projectId, query: q, limit: query.limit });
+    });
   });
 
   // ---- exports (accepted content only) --------------------------------------------------------------
