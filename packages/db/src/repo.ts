@@ -6,7 +6,13 @@ import { type Client, type Pool, rethrowCanon, withTransaction } from './client.
 import { withFencedTransaction, type LeaseClaim } from './leases.js';
 import { measure, toNfcText } from '@yeonjae/prose';
 import { createHash } from 'node:crypto';
-import { METRIC, METRIC_HELP, type Metrics, safeLabelValue, type StoryClock } from '@yeonjae/domain';
+import {
+  METRIC,
+  METRIC_HELP,
+  type Metrics,
+  safeLabelValue,
+  type StoryClock,
+} from '@yeonjae/domain';
 
 type Queryable = Pool | Client;
 
