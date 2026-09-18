@@ -1064,12 +1064,46 @@ concurrent steal against an open fenced transaction" failed once in a combined
 and not caused by this tranche's changes; it does not block deterministic continuation and is **not**
 worked around by weakening the assertion.
 
-**Scope limits, stated rather than glossed.** The following are credential-free and **were not done** in
-this tranche; they remain listed in `12-remaining-external-work.md` under "Not blocked, and honestly
-still open": worker liveness/readiness endpoints and an explicit API drain phase; operator `/v1` and CLI
-surfaces for the new subsystems (the controls exist as tested library functions); **metric call sites** for
-the new counters (names, labels, cardinality guards and template validation exist, but the gateway, worker
-and retrieval paths do not yet increment them); the remaining deterministic workflow surfaces; local
+**Scope limits, stated rather than glossed.** The following were credential-free and **were not done** in
+that tranche: worker liveness/readiness endpoints and an explicit API drain phase; operator `/v1` and CLI
+surfaces for the new subsystems (the controls existed as tested library functions); **metric call sites**
+for the new counters (names, labels, cardinality guards and template validation existed, but the gateway,
+worker and retrieval paths did not increment them); the remaining deterministic workflow surfaces; local
 recovery completion beyond the current 40 invariants; credential-rotation simulation; bounded performance
-smoke tests; and the single end-to-end automated-readiness scenario. **Phase 4 remains incomplete**, no
-live provider call was made, and no real credential was used.
+smoke tests; and the single end-to-end automated-readiness scenario. Several of these were completed
+afterwards — see the continuation section below. **Phase 4 remains incomplete**, no live provider call was
+made, and no real credential was used.
+
+### Credential-free automated-readiness continuation (`sigma33web/New`, 2026-09-18)
+
+Continued from the inherited head `f65a4c9c42ff6b970b1889cc574613ef3e9d43d1` (22 commits ahead of the
+base `30cb62af6fed0ac685fe29d44cae0f471577aab1`, 0 behind), preserved commit-for-commit on the branch
+`hoplite/hattusa-72f3a6b9` in the writable fork `sigma33web/New`. No inherited commit was amended,
+cherry-picked, squashed or rewritten, and nothing was pushed to any other repository.
+
+**The inherited head was not CI-validated.** sigma32's exact-head run failed at `pnpm format:check`, and
+because formatting runs before the test stages, *every test stage was skipped*. The cause was a single
+file: commit `32b12ae` widened the `@yeonjae/domain` import in `packages/db/src/repo.ts` past the
+configured print width without reformatting. The repair re-wraps that import list and contains no
+semantic change. With formatting fixed, the complete suite was run against local PostgreSQL 16.14 for the
+first time at this head: **89 files, 1,360 tests, all passing, none skipped.**
+
+Completed in this continuation:
+
+| Work | Evidence |
+| --- | --- |
+| Operator API and CLI surfaces | `/v1/operator/*` routes and `operator:*` CLI commands over ONE shared service layer (`packages/db/src/operator-diagnostics.ts`): limiter counters, live lease occupancy, shared-budget state, embedding-set completeness, GC candidates, thesaurus listing with ambiguity diagnostics, bounded retrieval diagnostics. 27 tests (16 API, 11 CLI) covering authentication, tenant isolation, scope-from-auth, bounding, malformed input and redaction |
+| Versioned backup manifests | `packages/db/src/backup-manifest.ts`; 15 tests covering the valid case, checksum mismatch, truncation, missing/malformed manifests, unsupported versions, schema newer than the application, schema below the floor, wrong manifest/artifact association, missing artifact, absent secret-exclusion assertion, credential refusal, repeatability and numeric ordering |
+| Local WAL/PITR rehearsal | `pnpm drill:pitr`. **PASSED** on local PostgreSQL 16.14: base backup, recorded recovery target, restore-and-replay, pre-target rows present (2), post-target rows absent (0), all processes and files cleaned up. Capability-gated with a structured `CAPABILITY_BLOCKED` result where no server can be started |
+| Bounded performance smoke tests | `pnpm test:perf-smoke`, separate from the correctness suites; 8 tests over 10 measured paths, monotonic timing, warm-up, broad ceilings, registry-growth and output-size bounds, environment metadata recorded to `coverage/perf-smoke-report.json` |
+
+**This is local evidence only.** The PITR rehearsal proves the WAL/recovery-target configuration works on
+this PostgreSQL build; it says nothing about staging or production recovery, off-site backup, retention or
+object-store durability. The performance figures are bounded smoke results on a shared 2-CPU sandbox and
+are **not** production throughput, latency or capacity.
+
+**Still open and credential-free** (carried in `12-remaining-external-work.md`): an explicit API drain
+phase with telemetry flush and a degraded-versus-unavailable distinction; operator *mutations* (embedding-
+set activation/rollback, thesaurus create/deactivate/reactivate, job cancellation) as audited owner-gated
+endpoints — the current operator surface is read-only; the remaining deterministic workflow surfaces from
+`02-backlog.md`; and the single wired end-to-end automated-readiness scenario.

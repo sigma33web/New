@@ -48,30 +48,37 @@ exist before the live tranche begins.
 ## Not blocked, and honestly still open
 
 Recorded here so the list above cannot be read as "everything else is done". These are credential-free and
-could be implemented next. The previous entries for shared enforcement, local embeddings, versioned vector
-retrieval, the thesaurus, multi-process tests, metrics and deployment/alert templates have been **removed
-because they are now implemented** (see `09-progress.md`).
+could be implemented next. Entries for shared enforcement, local embeddings, versioned vector retrieval,
+the thesaurus, multi-process tests, metrics and deployment/alert templates were removed earlier because
+they are implemented (see `09-progress.md`).
 
-- **Health, readiness and graceful shutdown completion.** Readiness already fails closed on migration
-  state, schema drift and role attributes, and the worker now drains its Temporal connection and pool on
-  every exit path. Not done: a worker liveness/readiness endpoint of its own, an explicit API drain phase
-  with a bounded deadline, telemetry flush on shutdown, and a declared degraded-versus-unavailable
-  distinction for optional dependencies.
-- **Operator API and CLI surfaces for the new subsystems.** The controls exist as library functions with
-  tests (rate-limit status, budget status, embedding-set activation and rollback, retrieval diagnostics,
-  thesaurus expansion diagnostics), and the operator `/v1` and CLI surfaces that would expose them have
-  **not** been added.
-- **Metric call sites.** The metric names, help text, label allowlist and cardinality tests exist and are
-  validated against the alert and dashboard templates. The new counters are **not yet incremented from the
-  gateway, worker and retrieval paths**; only the pre-existing API metrics have live call sites.
+Four further entries were removed in the same spirit, because they are now implemented and tested:
+
+- **Metric call sites** — the new counters are incremented from the gateway, worker and retrieval paths
+  (`32b12ae`), with emission and coverage suites.
+- **Credential-rotation simulation** — the fake-credential state machine, overlap windows,
+  retired-credential rejection and rollback exist with no real secret anywhere (`ca4e880`).
+- **Worker liveness/readiness and bounded draining** — the worker health surface and the bounded drain
+  state machine exist and are exercised by a real-process lifecycle suite (`f65a4c9`).
+- **Operator API and CLI surfaces** — the `/v1/operator/*` routes and `operator:*` CLI commands now expose
+  limiter counters, lease occupancy, shared-budget state, embedding-set completeness, GC candidates,
+  thesaurus listings with ambiguity diagnostics and bounded retrieval diagnostics, over one shared service
+  layer, with authorization, isolation, bounding, malformed-input and redaction tests.
+- **Local recovery completion** — versioned backup manifests with checksums and compatibility metadata,
+  the full matrix of refusal cases, and a local WAL/PITR rehearsal (`pnpm drill:pitr`) that passes on
+  PostgreSQL 16 and reports `CAPABILITY_BLOCKED` where a server cannot be started.
+- **Bounded performance smoke tests** — `pnpm test:perf-smoke`, separate from the correctness suites,
+  recording environment metadata with every run.
+
+Still open and credential-free:
+
+- **API drain phase and telemetry flush.** The worker has bounded draining and a health surface; the API
+  does not yet have an equivalent explicit drain phase with a bounded deadline, a telemetry flush on
+  shutdown, or a declared degraded-versus-unavailable distinction for optional dependencies.
 - **The remaining deterministic workflow surfaces** listed in `02-backlog.md` (batch operations,
   regeneration preview, typography and platform-format checks, deterministic export preparation).
-- **Local recovery completion beyond the current 40 invariants:** a backup manifest with migration hashes
-  and checksums, injected-failure cases (truncated backup, checksum mismatch, missing migration,
-  interrupted restore), and a local-only WAL/PITR rehearsal harness.
-- **Credential-rotation simulation** with generated fake credentials: key identifiers, overlap windows,
-  retired-credential rejection, rollback, and a fake local secret-manager adapter.
-- **Bounded performance smoke tests** (concurrent API requests, shared admission and reservation
-  throughput, retrieval latency, N+1 and index checks).
+- **Operator mutations.** The operator surface is currently READ-ONLY. Embedding-set activation and
+  rollback, thesaurus create/deactivate/reactivate and job cancellation exist as tested services but are
+  not yet exposed as audited, owner-gated operator mutations.
 - **One full deterministic end-to-end automated-readiness scenario** wiring all of the above together in a
   single run with a no-skip guard.
