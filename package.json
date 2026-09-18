@@ -23,6 +23,7 @@
     "drill:restore": "node tools/run-restore-drill.mjs",
     "drill:pitr": "node tools/run-pitr-rehearsal.mjs",
     "test:perf-smoke": "vitest run packages/db/src/perf-smoke.test.ts",
+    "test:e2e-readiness": "vitest run packages/workflows/src/readiness-scenario.integration.test.ts",
     "test:security": "node tools/run-security-suite.mjs",
     "test:costs": "node tools/run-cost-suite.mjs",
     "gen:types": "tsx tools/gen-types.ts",
