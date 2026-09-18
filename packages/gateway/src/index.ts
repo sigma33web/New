@@ -6,3 +6,5 @@ export * from './failures.js';
 export * from './guard.js';
 export * from './gateway.js';
 export * from './replay-provider.js';
+export * from './http-provider.js';
+export * from './synthetic-provider-service.js';
