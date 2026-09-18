@@ -70,15 +70,26 @@ Four further entries were removed in the same spirit, because they are now imple
 - **Bounded performance smoke tests** — `pnpm test:perf-smoke`, separate from the correctness suites,
   recording environment metadata with every run.
 
+Three further entries were removed because they are now implemented and tested:
+
+- **API drain phase** — the API runs the same `LifecycleCoordinator` as the worker. Readiness fails
+  synchronously the instant a drain begins, liveness keeps succeeding and reports `stopping`, new work is
+  refused with a 503 `SERVICE_DRAINING` problem document, the deadline is enforced with a distinct exit
+  code, and telemetry flush is bounded independently. 15 real-process signal tests.
+- **Operator mutations** — embedding-set activation and rollback and thesaurus
+  create/deactivate/reactivate are exposed as owner-gated, audited mutations on both `/v1/operator/*` and
+  the CLI, over the same shared service layer as the reads.
+- **The end-to-end automated-readiness scenario** — one ordered 20-stage run through real boundaries with
+  a no-skip guard (`pnpm test:e2e-readiness`).
+
 Still open and credential-free:
 
-- **API drain phase and telemetry flush.** The worker has bounded draining and a health surface; the API
-  does not yet have an equivalent explicit drain phase with a bounded deadline, a telemetry flush on
-  shutdown, or a declared degraded-versus-unavailable distinction for optional dependencies.
 - **The remaining deterministic workflow surfaces** listed in `02-backlog.md` (batch operations,
-  regeneration preview, typography and platform-format checks, deterministic export preparation).
-- **Operator mutations.** The operator surface is currently READ-ONLY. Embedding-set activation and
-  rollback, thesaurus create/deactivate/reactivate and job cancellation exist as tested services but are
-  not yet exposed as audited, owner-gated operator mutations.
-- **One full deterministic end-to-end automated-readiness scenario** wiring all of the above together in a
-  single run with a no-skip guard.
+  regeneration preview, typography and platform-format checks, deterministic export preparation). These
+  are product surfaces rather than readiness gaps.
+- **A degraded-versus-unavailable distinction for optional dependencies.** Readiness already reports a
+  `degraded` status, but which dependencies are optional is not yet declared per dependency.
+- **Job cancellation as an operator-surface mutation.** Cancellation is implemented and tested end to end
+  through `POST /v1/jobs/:jobAction` (owner-gated) and through the durable control path; it is
+  deliberately NOT duplicated under `/v1/operator/*`, because a second route onto the same state machine
+  would be two authorization surfaces for one action.

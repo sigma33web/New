@@ -1107,3 +1107,37 @@ phase with telemetry flush and a degraded-versus-unavailable distinction; operat
 set activation/rollback, thesaurus create/deactivate/reactivate, job cancellation) as audited owner-gated
 endpoints — the current operator surface is read-only; the remaining deterministic workflow surfaces from
 `02-backlog.md`; and the single wired end-to-end automated-readiness scenario.
+
+### Final credential-free tranche (`sigma33web/New`, continued 2026-09-18)
+
+Continued on the same branch `hoplite/hattusa-72f3a6b9` from `8d35a9889d7ceff97e44d210ed82df1de09caf0e`,
+whose CI and planning validation were both green. The four items listed immediately above are now
+implemented, with one deliberate exception recorded below.
+
+| Work | Evidence |
+| --- | --- |
+| **API graceful drain** | The API runs the same `LifecycleCoordinator` as the worker: readiness fails synchronously the instant drain begins (before any dependency probe), liveness keeps succeeding and reports `stopping`, new work is refused with a 503 `SERVICE_DRAINING` problem document and a `retry-after`, in-flight requests finish inside a bounded deadline, the deadline produces a distinct exit code, telemetry flush is bounded independently, and a close that throws never strands the other resources. **15 real-process tests** spawn the actual API and signal it, synchronising on JSON state lines and HTTP probes with no sleeps. |
+| **Operator mutations** | Embedding-set activation and rollback, and thesaurus create/deactivate/reactivate, on `/v1/operator/*` and the CLI over one shared service layer. Owner-gated, audited on **both** success and refusal, idempotent, with cross-tenant and cross-project targets answered as 404. **18 API + 16 CLI tests.** |
+| **End-to-end readiness scenario** | One ordered **20-stage** run through real boundaries (`pnpm test:e2e-readiness`), failing if any stage is skipped. Recorded: 17 migrations with hashes, 25 provider attempts, 43 artifacts all content-hashed, 74 vectors, incomplete-set activation refused, budget settled at 4,200 millicents with a released reservation leaving 0 outstanding, 0 live leases, second tenant observing 0 projects / 0 calls / 0 aliases, backup manifest verified, FORCE RLS intact and PUBLIC EXECUTE revoked. |
+
+**Defects found and fixed in this tranche** (all found by the new tests, none pre-existing in production
+paths): operator mutation body and path validation ran **before** authentication, so an anonymous caller
+with a malformed body received 422 and learned the request schema; the thesaurus route re-resolved the
+auth scope **inside** its transaction, taking a second pooled connection while holding one and
+deadlocking a small pool into a 500; and migration 0017's rule that every alias kind except `terminology`
+names an entity was unenforced at the boundary, surfacing as a 500 constraint violation instead of a
+stable `ALIAS_INVALID`.
+
+**Workflow-surface reconciliation.** All 35 deterministic lifecycle capability areas were reconciled
+against the code. Every one is implemented and tested; no genuine gap remained to implement. Two backlog
+notes were **stale rather than open**: B-4-9's "limiter and budget not yet wired into the worker's
+production path" was completed by `45e6b2e`, and the outbox entry is satisfied by the append-only
+`job_events` log plus SSE rather than a separate outbox table.
+
+**Deliberately not done, with reason.** Job cancellation is NOT duplicated as an `/v1/operator/*`
+mutation. It is already implemented, owner-gated and tested through `POST /v1/jobs/:jobAction` and the
+durable control path; a second route onto the same state machine would mean two authorization surfaces
+for one action, which is a security regression rather than a feature.
+
+**Inherited lease-fence flake:** still not reproduced. It passed every observation in this tranche as
+well. Nothing was weakened, skipped or slept around; it remains recorded rather than hidden.
