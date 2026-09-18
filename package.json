@@ -21,6 +21,7 @@
     "test:replay-120": "node tools/run-longform-replay.mjs",
     "test:chaos": "node tools/run-chaos-drills.mjs",
     "drill:restore": "node tools/run-restore-drill.mjs",
+    "drill:pitr": "node tools/run-pitr-rehearsal.mjs",
     "test:security": "node tools/run-security-suite.mjs",
     "test:costs": "node tools/run-cost-suite.mjs",
     "gen:types": "tsx tools/gen-types.ts",

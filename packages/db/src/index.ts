@@ -20,6 +20,7 @@ export * from './provider-admission.js';
 export * from './shared-budget.js';
 export * from './readiness.js';
 export * from './restore-drill.js';
+export * from './backup-manifest.js';
 export * from './restore-report.js';
 export * from './security-report.js';
 export * from './cost-accounting.js';
