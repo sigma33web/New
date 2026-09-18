@@ -14,10 +14,12 @@
 import { randomUUID } from 'node:crypto';
 import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
 import {
+  activateEmbeddingSetForOperator,
   budgetReport,
   BUDGET_SCOPE_KINDS,
   COST_DIMENSIONS,
   costSummary,
+  createAliasForOperator,
   createSession,
   embeddingSetReport,
   entitiesOfType,
@@ -29,6 +31,8 @@ import {
   listCommits,
   manuscriptVersionsOf,
   needsAttention,
+  OperatorMutationError,
+  OPERATOR_ALIAS_KINDS,
   OPERATION_CLASSES,
   rateLimitStatus as operatorRateLimitStatus,
   queryString,
@@ -36,6 +40,8 @@ import {
   requestJobControl,
   retrievalDiagnostics,
   revokeSession,
+  rollbackEmbeddingSetForOperator,
+  setAliasActiveForOperator,
   thesaurusListing,
   timelinesOf,
   verifyPassword,
@@ -1523,6 +1529,182 @@ export function buildApi(options: ApiOptions): FastifyInstance {
       return retrievalDiagnostics(c, { projectId, query: q, limit: query.limit });
     });
   });
+
+  // ---- operator mutations (Workstream B) -------------------------------------------------------------
+  //
+  // Every route below changes what the system does next, so all of them share one policy:
+  //
+  //   * OWNER ONLY. Activating an embedding set changes what every subsequent retrieval reads, and a
+  //     thesaurus edit changes how queries resolve. Those are the same class of consequence as a canon
+  //     rollback, which is already owner-gated.
+  //   * AUDITED, on success and on refusal. A refused mutation is exactly as interesting as a successful
+  //     one when reconstructing what an operator attempted, so both append to `audit_log`. The detail is
+  //     the SAFE payload the service layer returns, never raw error text.
+  //   * SCOPE FROM THE AUTH CONTEXT. The project is resolved through `projectOr404` inside the RLS scope
+  //     before any service sees it, so a cross-tenant id is a 404 rather than a refusal that confirms it.
+  //   * ONE TRANSACTION where the mutation and its audit row must agree. `inScope` runs both against the
+  //     same scoped client, so an audit row cannot survive a rolled-back mutation.
+
+  /** Map the service layer's closed code set onto problem documents. */
+  function operatorProblem(err: unknown): never {
+    if (err instanceof OperatorMutationError) {
+      if (err.code === 'NOT_FOUND') throw new ApiError('NOT_FOUND', err.message);
+      if (err.code === 'ALIAS_INVALID') throw new ApiError('VALIDATION_FAILED', err.message);
+      // Everything else is a precondition the caller can resolve and retry: 409, not 500.
+      throw new ApiError('CONFLICT', err.message, { data: { reason: err.code } });
+    }
+    throw err;
+  }
+
+  /**
+   * Run an owner-gated mutation, auditing both outcomes.
+   *
+   * The refusal audit is written in its OWN transaction, because the mutation's transaction is being
+   * rolled back — writing the refusal inside it would roll the evidence back too, which is precisely
+   * when an audit trail matters most.
+   */
+  async function operatorMutation<T>(
+    req: FastifyRequest,
+    action: string,
+    projectId: string,
+    run: (
+      c: Client,
+      scope: WorkspaceScope,
+    ) => Promise<{ result: T; audit: Readonly<Record<string, unknown>> }>,
+  ): Promise<T> {
+    const scope = await scoped(pool, req);
+    requireRole(scope, 'owner');
+    try {
+      return await inScope(pool, scope, async (c) => {
+        await projectOr404(c, projectId);
+        // `scope` is passed through rather than re-resolved inside the callback: calling `scoped`
+        // again here would take a SECOND connection from the pool while this one is held, which
+        // deadlocks a small pool and surfaced as a 500.
+        const outcome = await run(c, scope);
+        await audit(c, scope, {
+          action,
+          projectId,
+          targetKind: 'operator',
+          requestId: req.id,
+          detail: { outcome: 'succeeded', ...outcome.audit },
+        });
+        return outcome.result;
+      });
+    } catch (err) {
+      if (err instanceof OperatorMutationError) {
+        await inScope(pool, scope, async (c) => {
+          await audit(c, scope, {
+            action,
+            projectId,
+            targetKind: 'operator',
+            requestId: req.id,
+            // The CODE only: raw error text could carry detail that does not belong in an audit row.
+            detail: { outcome: 'refused', reason: err.code },
+          });
+        });
+      }
+      return operatorProblem(err);
+    }
+  }
+
+  app.post(
+    '/v1/projects/:projectId/operator/embedding-sets/:setId/activate',
+    async (req, reply) => {
+      const params = req.params as { projectId?: string; setId?: string };
+      const projectId = requireUuid(params.projectId, 'params.projectId');
+      const setId = requireUuid(params.setId, 'params.setId');
+      const result = await operatorMutation(
+        req,
+        'operator.embedding_set.activate',
+        projectId,
+        (c) => activateEmbeddingSetForOperator(c, { projectId, setId }),
+      );
+      return reply.status(200).send(result);
+    },
+  );
+
+  app.post('/v1/projects/:projectId/operator/embedding-sets/rollback', async (req, reply) => {
+    const projectId = requireUuid(
+      (req.params as { projectId?: string }).projectId,
+      'params.projectId',
+    );
+    const result = await operatorMutation(req, 'operator.embedding_set.rollback', projectId, (c) =>
+      rollbackEmbeddingSetForOperator(c, { projectId }),
+    );
+    return reply.status(200).send(result);
+  });
+
+  app.post('/v1/projects/:projectId/operator/thesaurus', async (req, reply) => {
+    const projectId = requireUuid(
+      (req.params as { projectId?: string }).projectId,
+      'params.projectId',
+    );
+    const result = await operatorMutation(
+      req,
+      'operator.thesaurus.create',
+      projectId,
+      async (c, scope) => {
+        /**
+         * Body validation happens INSIDE the authorized callback.
+         *
+         * Validating before `operatorMutation` authenticated the caller meant an anonymous request with
+         * a malformed body got 422 — telling an unauthenticated stranger about the request schema, and
+         * answering something other than "who are you?" to a request that had no business being parsed.
+         */
+        const body = asObject(req.body);
+        const surface = requireString(body, 'surface', { max: 200 });
+        const kind = requireEnum(body.kind ?? 'alias', OPERATOR_ALIAS_KINDS, 'body.kind');
+        const entityId = body.entity_id
+          ? requireUuid(queryString(body.entity_id), 'body.entity_id')
+          : undefined;
+        // The entity must be visible in THIS project: an alias pointing at another project's entity
+        // would be a cross-project write dressed up as a thesaurus edit.
+        if (entityId) {
+          const found = await c.query<{ id: string }>(
+            'SELECT id FROM entities WHERE id = $1 AND project_id = $2',
+            [entityId, projectId],
+          );
+          if (!found.rows[0])
+            throw new OperatorMutationError('NOT_FOUND', 'The entity does not exist.');
+        }
+        return createAliasForOperator(c, {
+          workspaceId: scope.workspaceId,
+          projectId,
+          surface,
+          kind,
+          entityId,
+        });
+      },
+    );
+    return reply.status(201).send(result);
+  });
+
+  app.post(
+    '/v1/projects/:projectId/operator/thesaurus/:aliasId/:aliasAction',
+    async (req, reply) => {
+      const params = req.params as { projectId?: string; aliasId?: string; aliasAction?: string };
+      const projectId = requireUuid(params.projectId, 'params.projectId');
+      /**
+       * The action is parsed BEFORE the mutation runs because it names the audit action, but the alias id
+       * is validated inside the authorized callback for the same reason the body is: an unauthenticated
+       * caller must be told "who are you?", not "your id is malformed".
+       */
+      const action = requireEnum(
+        params.aliasAction,
+        ['deactivate', 'reactivate'] as const,
+        'params.aliasAction',
+      );
+      const result = await operatorMutation(req, `operator.thesaurus.${action}`, projectId, (c) => {
+        const aliasId = requireUuid(params.aliasId, 'params.aliasId');
+        return setAliasActiveForOperator(c, {
+          projectId,
+          aliasId,
+          active: action === 'reactivate',
+        });
+      });
+      return reply.status(200).send(result);
+    },
+  );
 
   // ---- exports (accepted content only) --------------------------------------------------------------
   app.get('/v1/projects/:projectId/exports/preview', async (req) => {

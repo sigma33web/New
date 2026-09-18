@@ -33,9 +33,15 @@ import {
   listCommits,
   migrate,
   OPERATION_CLASSES,
+  OPERATOR_ALIAS_KINDS,
+  OperatorMutationError,
+  activateEmbeddingSetForOperator,
+  createAliasForOperator,
   rateLimitStatus,
   retrievalDiagnostics,
   rollbackLatest,
+  rollbackEmbeddingSetForOperator,
+  setAliasActiveForOperator,
   stateAt,
   thesaurusListing,
   withWorkspace,
@@ -573,6 +579,96 @@ export async function runDb(argv: readonly string[]): Promise<AsyncCommandResult
           ),
         };
       }
+      /**
+       * Operator MUTATIONS (Workstream B).
+       *
+       * Same service layer as the `/v1/operator/*` routes, so the CLI cannot make a different decision
+       * from the API. `OperatorMutationError` is translated into `{ error, detail }` with `ok: false`,
+       * which `main.ts` turns into a non-zero exit code — a stable, documented contract for scripts.
+       *
+       * Authorization note: the CLI runs with direct database credentials and is therefore an
+       * ADMINISTRATIVE surface by construction, the same as `db:migrate` and `canon:rollback` already
+       * are. The owner-role check lives on the HTTP boundary, where an untrusted caller exists.
+       */
+      case 'operator:embedding-activate': {
+        const [projectId, setId] = rest;
+        if (!projectId || !setId) return { ok: false, output: USAGE };
+        const project = await getProject(pool, projectId);
+        try {
+          const outcome = await withWorkspace(pool, project.workspace_id, (c) =>
+            activateEmbeddingSetForOperator(c, { projectId, setId }),
+          );
+          return { ok: true, output: outcome.result };
+        } catch (err) {
+          if (err instanceof OperatorMutationError)
+            return { ok: false, output: { error: err.code, detail: err.message } };
+          throw err;
+        }
+      }
+      case 'operator:embedding-rollback': {
+        const [projectId] = rest;
+        if (!projectId) return { ok: false, output: USAGE };
+        const project = await getProject(pool, projectId);
+        try {
+          const outcome = await withWorkspace(pool, project.workspace_id, (c) =>
+            rollbackEmbeddingSetForOperator(c, { projectId }),
+          );
+          return { ok: true, output: outcome.result };
+        } catch (err) {
+          if (err instanceof OperatorMutationError)
+            return { ok: false, output: { error: err.code, detail: err.message } };
+          throw err;
+        }
+      }
+      case 'operator:thesaurus-add': {
+        const [projectId, surface, ...flags] = rest;
+        if (!projectId || !surface) return { ok: false, output: USAGE };
+        const requested =
+          flags.find((f) => f.startsWith('--kind='))?.slice('--kind='.length) ?? 'alias';
+        const kind = OPERATOR_ALIAS_KINDS.find((k) => k === requested);
+        if (!kind)
+          return {
+            ok: false,
+            output: {
+              error: 'ALIAS_INVALID',
+              detail: `--kind must be one of: ${OPERATOR_ALIAS_KINDS.join(', ')}`,
+            },
+          };
+        const entityId = flags.find((f) => f.startsWith('--entity='))?.slice('--entity='.length);
+        const project = await getProject(pool, projectId);
+        try {
+          const outcome = await withWorkspace(pool, project.workspace_id, (c) =>
+            createAliasForOperator(c, {
+              workspaceId: project.workspace_id,
+              projectId,
+              surface,
+              kind,
+              entityId,
+            }),
+          );
+          return { ok: true, output: outcome.result };
+        } catch (err) {
+          if (err instanceof OperatorMutationError)
+            return { ok: false, output: { error: err.code, detail: err.message } };
+          throw err;
+        }
+      }
+      case 'operator:thesaurus-set-active': {
+        const [projectId, aliasId, state] = rest;
+        if (!projectId || !aliasId || (state !== 'on' && state !== 'off'))
+          return { ok: false, output: USAGE };
+        const project = await getProject(pool, projectId);
+        try {
+          const outcome = await withWorkspace(pool, project.workspace_id, (c) =>
+            setAliasActiveForOperator(c, { projectId, aliasId, active: state === 'on' }),
+          );
+          return { ok: true, output: outcome.result };
+        } catch (err) {
+          if (err instanceof OperatorMutationError)
+            return { ok: false, output: { error: err.code, detail: err.message } };
+          throw err;
+        }
+      }
       case 'chapter:resume': {
         const [workflowId, ...flags] = rest;
         if (!workflowId) return { ok: false, output: USAGE };
@@ -1048,6 +1144,10 @@ export const DB_COMMANDS = new Set([
   'operator:embedding-gc',
   'operator:thesaurus',
   'operator:retrieval',
+  'operator:embedding-activate',
+  'operator:embedding-rollback',
+  'operator:thesaurus-add',
+  'operator:thesaurus-set-active',
 ]);
 
 export function cmdIdentityCompile(
@@ -1149,6 +1249,13 @@ Database commands (DATABASE_URL required):
                                                project thesaurus with its ambiguity diagnostic, bounded
   operator:retrieval <project> <query> [--limit=20]
                                                bounded hybrid-retrieval diagnostic (ranking only, never passages)
+  operator:embedding-activate <project> <set-id>
+                                               activate an embedding set (refuses an empty or incomplete set)
+  operator:embedding-rollback <project>        restore the embedding set the active one replaced
+  operator:thesaurus-add <project> <surface> [--kind=alias] [--entity=<id>]
+                                               add a thesaurus entry; every kind except terminology names an entity
+  operator:thesaurus-set-active <project> <alias-id> on|off
+                                               reactivate or deactivate an alias (never deleted: a former name is history)
   constraints:compile <chapter#> <spec.json> [cap]
                                                compile the Active Constraint Set for a chapter (no database)
 `;

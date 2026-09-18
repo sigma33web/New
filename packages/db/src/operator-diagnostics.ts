@@ -25,9 +25,21 @@ import {
   activeEmbeddingSet,
   embeddingSetCompleteness,
   gcEligibleEmbeddingSets,
+  activateEmbeddingSet,
+  getEmbeddingSet,
+  rollbackEmbeddingSet,
   type EmbeddingPurpose,
+  type EmbeddingSetRow,
 } from './embeddings.js';
-import { aliasesForProject, expandQuery } from './thesaurus.js';
+import {
+  addAlias,
+  aliasesForProject,
+  deactivateAlias,
+  expandQuery,
+  normalizeSurface,
+  type AliasKind,
+  type NameAliasRow,
+} from './thesaurus.js';
 import { hybridSearch, type RetrievalMode } from './hybrid-retrieval.js';
 import { budgetStatus, findBudgetPolicy, type BudgetScopeKind } from './shared-budget.js';
 import {
@@ -75,6 +87,323 @@ export const BUDGET_SCOPE_KINDS = [
  */
 export function queryString(value: unknown): string | undefined {
   return typeof value === 'string' && value !== '' ? value : undefined;
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// operator mutations (Workstream B)
+//
+// The read side above answers questions; these change what the system does next. Three rules apply to
+// every one of them, and they are the reason the mutations live here rather than in each surface:
+//
+//  * THEY ARE SCOPED BY THE CALLER'S CLIENT, exactly like the reads. No mutation takes a workspace id,
+//    so a body field cannot widen what is written; a target outside the caller's RLS scope is simply
+//    invisible and comes back as "not found" rather than as a refusal that confirms it exists.
+//  * THEY FAIL WITH A STABLE CODE. `OperatorMutationError` carries a closed set of codes so the API can
+//    map them to problem documents and the CLI to exit codes without either one parsing prose.
+//  * THEY RETURN A BOUNDED, REDACTED RESULT plus a safe audit payload. The caller writes the audit row
+//    (it owns the actor and request id); this layer decides what is SAFE to record, which is how a
+//    surface cannot accidentally log a credential or a passage.
+// ---------------------------------------------------------------------------------------------------------
+
+export type OperatorMutationCode =
+  | 'NOT_FOUND'
+  | 'EMBEDDING_SET_EMPTY'
+  | 'EMBEDDING_SET_INCOMPLETE'
+  | 'EMBEDDING_SET_RETIRED'
+  | 'NO_ROLLBACK_TARGET'
+  | 'ALIAS_INVALID'
+  | 'CONFLICT';
+
+export class OperatorMutationError extends Error {
+  constructor(
+    readonly code: OperatorMutationCode,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'OperatorMutationError';
+  }
+}
+
+/**
+ * Translate a database-raised code into the operator vocabulary.
+ *
+ * The embedding-set guards live in migration 0016 as `canon.raise_code(...)`, which is the right place
+ * for them — they must hold against ANY writer, not only this layer. This maps the raised code onto the
+ * operator's closed set so the boundary never re-implements the rule, and an unrecognised failure is
+ * rethrown untouched rather than being flattened into a misleading operator code.
+ */
+function asMutationError(err: unknown): never {
+  const text = err instanceof Error ? err.message : String(err);
+  for (const code of [
+    'EMBEDDING_SET_INCOMPLETE',
+    'EMBEDDING_SET_EMPTY',
+    'EMBEDDING_SET_RETIRED',
+  ] as const) {
+    if (text.includes(code))
+      throw new OperatorMutationError(
+        code,
+        code === 'EMBEDDING_SET_EMPTY'
+          ? 'The set has no vectors; activating it would make retrieval silently return nothing.'
+          : code === 'EMBEDDING_SET_INCOMPLETE'
+            ? 'The set has failed items; activating it would make retrieval quietly wrong.'
+            : 'A retired set cannot be activated directly; roll back to it instead.',
+      );
+  }
+  throw err;
+}
+
+/** The safe, bounded record of a mutation. Never carries text, secrets or another tenant's ids. */
+export interface MutationOutcome<T> {
+  readonly result: T;
+  readonly audit: Readonly<Record<string, string | number | boolean>>;
+}
+
+export interface EmbeddingSetSummary {
+  readonly set_id: string;
+  readonly purpose: string;
+  readonly status: string;
+  readonly item_count: number;
+  readonly activated_at: string | null;
+}
+
+function summarize(set: EmbeddingSetRow): EmbeddingSetSummary {
+  return {
+    set_id: set.id,
+    purpose: set.purpose,
+    status: set.status,
+    item_count: set.item_count,
+    activated_at: set.activated_at ? new Date(set.activated_at).toISOString() : null,
+  };
+}
+
+/**
+ * Activate an embedding set.
+ *
+ * Idempotent by construction: migration 0016 returns the set unchanged when it is already active, so a
+ * retried operator action or a redelivered request cannot flap the active pointer. Completeness is NOT
+ * re-checked here — the database refuses an empty or failed set itself, and duplicating that rule in
+ * the boundary would create a second place for it to drift.
+ */
+export async function activateEmbeddingSetForOperator(
+  c: Client,
+  input: { projectId: string; setId: string },
+): Promise<MutationOutcome<EmbeddingSetSummary>> {
+  // Resolved inside the caller's RLS scope first: a set in another workspace is invisible, so this is a
+  // NOT_FOUND rather than a refusal that would confirm the id exists.
+  const existing = await getEmbeddingSet(c, input.setId);
+  if (existing?.project_id !== input.projectId)
+    throw new OperatorMutationError('NOT_FOUND', 'The embedding set does not exist.');
+  const wasActive = existing.status === 'active';
+  let set: EmbeddingSetRow;
+  try {
+    set = await activateEmbeddingSet(c, input.setId);
+  } catch (err) {
+    asMutationError(err);
+  }
+  return {
+    result: summarize(set),
+    audit: {
+      set_id: set.id,
+      purpose: set.purpose,
+      item_count: set.item_count,
+      // Distinguishes a real promotion from an idempotent repeat in the audit trail.
+      already_active: wasActive,
+    },
+  };
+}
+
+/** Roll back to the set the active one replaced. Refuses when there is nothing to roll back to. */
+export async function rollbackEmbeddingSetForOperator(
+  c: Client,
+  input: { projectId: string; purpose?: EmbeddingPurpose | undefined },
+): Promise<MutationOutcome<EmbeddingSetSummary>> {
+  const purpose = input.purpose ?? 'retrieval';
+  const active = await activeEmbeddingSet(c, input.projectId, purpose);
+  if (!active)
+    throw new OperatorMutationError(
+      'NO_ROLLBACK_TARGET',
+      'There is no active embedding set for this purpose to roll back from.',
+    );
+  if (!active.replaced_set_id)
+    throw new OperatorMutationError(
+      'NO_ROLLBACK_TARGET',
+      'The active embedding set replaced nothing, so there is no previous set to restore.',
+    );
+  let set: EmbeddingSetRow;
+  try {
+    set = await rollbackEmbeddingSet(c, input.projectId, purpose);
+  } catch (err) {
+    asMutationError(err);
+  }
+  return {
+    result: summarize(set),
+    audit: { set_id: set.id, purpose, restored_from: active.id },
+  };
+}
+
+/**
+ * Alias kinds an operator may create.
+ *
+ * A closed list, and deliberately narrower than `AliasKind`: `canonical` is the entity's own name and is
+ * owned by the naming policy rather than by an operator edit, so exposing it here would let the operator
+ * surface rename a character through the thesaurus.
+ */
+export const OPERATOR_ALIAS_KINDS = [
+  'alias',
+  'former_name',
+  'title',
+  'honorific',
+  'romanization',
+  'spacing_variant',
+  'disguise',
+  'organization',
+  'location',
+  'terminology',
+] as const satisfies readonly AliasKind[];
+
+export interface AliasSummary {
+  readonly alias_id: string;
+  readonly surface: string;
+  readonly normalized: string;
+  readonly kind: string;
+  readonly entity_id: string | null;
+  readonly active: boolean;
+  readonly ambiguous: boolean;
+}
+
+function summarizeAlias(row: NameAliasRow): AliasSummary {
+  return {
+    alias_id: row.id,
+    surface: row.surface,
+    normalized: row.normalized,
+    kind: row.kind,
+    entity_id: row.entity_id,
+    active: row.active,
+    ambiguous: row.ambiguous,
+  };
+}
+
+/** A bounded surface: an unbounded one would be an unbounded index term and a payload hazard. */
+const MAX_SURFACE_CHARS = 200;
+
+/**
+ * Create (or update) a thesaurus alias.
+ *
+ * Upsert rather than insert, because `addAlias` is keyed on (project, kind, normalized, entity): a
+ * repeated operator action must converge on one row rather than failing or duplicating. The AMBIGUITY
+ * flag is computed rather than accepted from the caller — whether a surface resolves to more than one
+ * entity is a fact about the project's data, not an operator opinion.
+ */
+export async function createAliasForOperator(
+  c: Client,
+  input: {
+    workspaceId: string;
+    projectId: string;
+    surface: string;
+    kind: AliasKind;
+    entityId?: string | undefined;
+    fromChapter?: number | undefined;
+  },
+): Promise<MutationOutcome<AliasSummary>> {
+  const surface = input.surface.trim();
+  if (surface.length === 0 || surface.length > MAX_SURFACE_CHARS)
+    throw new OperatorMutationError(
+      'ALIAS_INVALID',
+      `A surface must be between 1 and ${String(MAX_SURFACE_CHARS)} characters.`,
+    );
+  const normalized = normalizeSurface(surface);
+  /**
+   * Migration 0017's check constraint: every kind except `terminology` names an entity, and
+   * `terminology` names none. Enforced here as well so the boundary answers with a stable code instead
+   * of letting a constraint violation surface as an internal error — the constraint stays in the
+   * database, where it holds against any writer; this only translates it.
+   */
+  if (input.kind === 'terminology' && input.entityId !== undefined)
+    throw new OperatorMutationError(
+      'ALIAS_INVALID',
+      'A terminology entry names no entity; omit entity_id.',
+    );
+  if (input.kind !== 'terminology' && input.entityId === undefined)
+    throw new OperatorMutationError(
+      'ALIAS_INVALID',
+      `A "${input.kind}" alias must name the entity it refers to; supply entity_id.`,
+    );
+  // Does this surface already point at a DIFFERENT entity? If so both rows are ambiguous, and saying so
+  // is the whole value of the thesaurus diagnostic.
+  const siblings = await aliasesForProject(c, input.projectId);
+  const others = siblings.filter(
+    (a) => a.normalized === normalized && a.active && a.entity_id && a.entity_id !== input.entityId,
+  );
+  const ambiguous = others.length > 0 && input.entityId !== undefined;
+
+  const row = await addAlias(c, {
+    workspaceId: input.workspaceId,
+    projectId: input.projectId,
+    entityId: input.entityId,
+    kind: input.kind,
+    surface,
+    provenance: 'operator',
+    ambiguous,
+    fromChapter: input.fromChapter,
+  });
+  if (ambiguous) {
+    // The existing rows become ambiguous too: ambiguity is a property of the SURFACE, and marking only
+    // the newcomer would leave the older row claiming to be unambiguous.
+    await c.query(
+      'UPDATE name_aliases SET ambiguous = true WHERE project_id = $1 AND normalized = $2',
+      [input.projectId, normalized],
+    );
+  }
+  return {
+    result: { ...summarizeAlias(row), ambiguous },
+    audit: {
+      alias_id: row.id,
+      kind: row.kind,
+      ambiguous,
+      // The surface itself is a project term, not a secret, and is what makes the audit row useful.
+      surface: surface.slice(0, MAX_SURFACE_CHARS),
+    },
+  };
+}
+
+/**
+ * Deactivate or reactivate an alias.
+ *
+ * Never deletes: a former name is history and may need to be explained later, which is the same reason
+ * `deactivateAlias` exists rather than a DELETE.
+ */
+export async function setAliasActiveForOperator(
+  c: Client,
+  input: { projectId: string; aliasId: string; active: boolean },
+): Promise<MutationOutcome<AliasSummary>> {
+  const found = await c.query<NameAliasRow>(
+    'SELECT * FROM name_aliases WHERE id = $1 AND project_id = $2',
+    [input.aliasId, input.projectId],
+  );
+  const row = found.rows[0];
+  if (!row) throw new OperatorMutationError('NOT_FOUND', 'The alias does not exist.');
+  if (row.active === input.active) {
+    // Idempotent: repeating the request is a no-op rather than an error, so a duplicate delivery is a
+    // non-event.
+    return {
+      result: summarizeAlias(row),
+      audit: { alias_id: row.id, active: row.active, unchanged: true },
+    };
+  }
+  if (input.active) {
+    await c.query('UPDATE name_aliases SET active = true WHERE id = $1', [input.aliasId]);
+  } else {
+    await deactivateAlias(c, input.aliasId);
+  }
+  const after = await c.query<NameAliasRow>('SELECT * FROM name_aliases WHERE id = $1', [
+    input.aliasId,
+  ]);
+  const updated = after.rows[0];
+  if (!updated) throw new OperatorMutationError('NOT_FOUND', 'The alias does not exist.');
+  return {
+    result: summarizeAlias(updated),
+    audit: { alias_id: updated.id, active: updated.active, unchanged: false },
+  };
 }
 
 /** Clamp a caller-supplied limit into the bounded range. Unparseable input falls back to the default. */

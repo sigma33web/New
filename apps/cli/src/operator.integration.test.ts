@@ -18,6 +18,8 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   createProject,
   createWorkspace,
+  createEmbeddingSet,
+  createEntity,
   migrate,
   resetDatabase,
   type Pool,
@@ -31,12 +33,13 @@ const run = databaseUrl() ? describe : describe.skip;
 run('CLI: operator diagnostics (Workstream A)', () => {
   let pool: Pool;
   let projectId: string;
+  let workspaceId: string;
 
   beforeAll(async () => {
     pool = await freshDatabase();
     await resetDatabase(pool);
     await migrate(pool);
-    const workspaceId = await createWorkspace(pool, 'CLI Operator Tenant');
+    workspaceId = await createWorkspace(pool, 'CLI Operator Tenant');
     const project = await createProject(pool, { workspaceId, title: 'CLI Operator Project' });
     projectId = project.projectId;
   }, 120_000);
@@ -53,6 +56,10 @@ run('CLI: operator diagnostics (Workstream A)', () => {
     'operator:embedding-gc',
     'operator:thesaurus',
     'operator:retrieval',
+    'operator:embedding-activate',
+    'operator:embedding-rollback',
+    'operator:thesaurus-add',
+    'operator:thesaurus-set-active',
   ] as const;
 
   it('registers every operator command so runDb routes it', () => {
@@ -131,5 +138,68 @@ run('CLI: operator diagnostics (Workstream A)', () => {
     const text = JSON.stringify(res.output);
     expect(text).not.toContain('postgres://');
     expect(text.toLowerCase()).not.toContain('password');
+  });
+
+  // ---- mutations (Workstream B) --------------------------------------------------------------------
+  //
+  // These call the SAME service layer as the `/v1/operator/*` mutation routes, so the checks here are
+  // about the CLI contract — a stable error code and a non-zero result rather than a thrown stack —
+  // not a re-proof of the underlying rules, which the API suite covers against HTTP.
+
+  it('refuses to activate an empty embedding set with the same code the API returns', async () => {
+    const set = await createEmbeddingSet(pool, {
+      workspaceId,
+      projectId,
+      provider: 'local',
+      modelId: 'deterministic',
+      modelVersion: '1.0.0',
+      dimension: 8,
+    });
+    const res = await runDb(['operator:embedding-activate', projectId, set.id]);
+    expect(res.ok).toBe(false);
+    expect((res.output as { error: string }).error).toBe('EMBEDDING_SET_EMPTY');
+  });
+
+  it('refuses a rollback with no previous set rather than throwing', async () => {
+    const res = await runDb(['operator:embedding-rollback', projectId]);
+    expect(res.ok).toBe(false);
+    expect((res.output as { error: string }).error).toBe('NO_ROLLBACK_TARGET');
+  });
+
+  it('adds, deactivates and reactivates a thesaurus entry', async () => {
+    const entityId = await createEntity(pool, {
+      workspaceId,
+      projectId,
+      type: 'character',
+      displayName: 'CLI Character',
+    });
+    const added = await runDb([
+      'operator:thesaurus-add',
+      projectId,
+      'CLI Alias',
+      `--entity=${entityId}`,
+    ]);
+    expect(added.ok, JSON.stringify(added.output)).toBe(true);
+    const aliasId = (added.output as { alias_id: string }).alias_id;
+
+    const off = await runDb(['operator:thesaurus-set-active', projectId, aliasId, 'off']);
+    expect(off.ok, JSON.stringify(off.output)).toBe(true);
+    expect((off.output as { active: boolean }).active).toBe(false);
+
+    const on = await runDb(['operator:thesaurus-set-active', projectId, aliasId, 'on']);
+    expect(on.ok, JSON.stringify(on.output)).toBe(true);
+    expect((on.output as { active: boolean }).active).toBe(true);
+  });
+
+  it('enforces the same alias entity rule the API enforces', async () => {
+    const res = await runDb(['operator:thesaurus-add', projectId, 'Orphan Title', '--kind=title']);
+    expect(res.ok).toBe(false);
+    expect((res.output as { error: string }).error).toBe('ALIAS_INVALID');
+  });
+
+  it('refuses an unknown alias kind with a stable code', async () => {
+    const res = await runDb(['operator:thesaurus-add', projectId, 'Whatever', '--kind=not-a-kind']);
+    expect(res.ok).toBe(false);
+    expect((res.output as { error: string }).error).toBe('ALIAS_INVALID');
   });
 });
