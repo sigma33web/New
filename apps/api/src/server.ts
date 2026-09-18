@@ -70,6 +70,7 @@ import {
 import { requireVerb } from './verbs.js';
 import { registerResourceRoutes } from './resource-routes.js';
 import { contentHashOf } from '@yeonjae/prose';
+import type { LifecycleCoordinator } from '@yeonjae/domain';
 import {
   correct as correctCanonOp,
   correctionView,
@@ -128,6 +129,15 @@ export interface ApiOptions {
    * deployment that forgets to configure this is strict rather than broken.
    */
   readonly corsOrigins?: readonly string[] | undefined;
+  /**
+   * Process lifecycle coordinator (Workstream C).
+   *
+   * Injected rather than constructed here because the coordinator's whole purpose is to span the
+   * process: `main.ts` owns the signal handlers and the resources that must close, and a test needs to
+   * drive drain directly. When absent the API behaves exactly as before — always accepting, always
+   * ready — so the many suites that build an app without a lifecycle are unaffected.
+   */
+  readonly lifecycle?: LifecycleCoordinator | undefined;
 }
 
 /** Maximum JSON body. A bounded body is the cheapest defence against memory-exhaustion requests. */
@@ -164,6 +174,15 @@ export function buildApi(options: ApiOptions): FastifyInstance {
   // Validated at construction, so an invalid origin fails at startup naming the exact value rather than
   // being silently dropped into a deployment that denies everything and looks configured.
   const corsPolicy: CorsPolicy = corsPolicyFrom(options.corsOrigins ?? []);
+  const lifecycle = options.lifecycle;
+  /**
+   * Requests admitted by the drain gate, by request id.
+   *
+   * A SET rather than a counter so the release in `onResponse` is idempotent: Fastify can complete a
+   * request through several paths (normal reply, error reply, client disconnect), and a bare decrement
+   * would eventually drift below the true count and let a drain finish while work was still running.
+   */
+  const inFlight = new Set<string>();
 
   app.addHook('onRequest', async (req, reply) => {
     /**
@@ -206,6 +225,31 @@ export function buildApi(options: ApiOptions): FastifyInstance {
      */
     const route = req.routeOptions.url ?? 'unmatched';
     if (route === '/health' || route === '/ready' || route === '/metrics') return;
+
+    /**
+     * Drain gate (Workstream C).
+     *
+     * Placed after the probe exemption above and before authentication, because during a drain the
+     * answer must not depend on who is asking: a draining instance refuses NEW work from everyone,
+     * while probes keep answering so an orchestrator can still observe the transition.
+     *
+     * 503 with `retry-after` is the honest answer — the work was not attempted and retrying elsewhere
+     * (or here, later) will succeed. Requests already in flight are unaffected; they are exactly what
+     * the drain deadline exists to let finish.
+     */
+    if (lifecycle && !lifecycle.beginWork()) {
+      metrics.increment(METRIC.drainRefusals, METRIC_HELP[METRIC.drainRefusals] ?? '', {
+        state: lifecycle.current(),
+      });
+      reply.header('retry-after', '5');
+      throw new ApiError(
+        'SERVICE_DRAINING',
+        'This instance is shutting down and is not accepting new requests.',
+      );
+    }
+    // Counted as in-flight only once the gate admitted it; `onResponse` below releases it.
+    if (lifecycle) inFlight.add(req.id);
+
     const identity = clientIdentity(
       { socketAddress: req.ip, forwardedFor: headerOf(req, 'x-forwarded-for') },
       { trustedProxies },
@@ -229,6 +273,8 @@ export function buildApi(options: ApiOptions): FastifyInstance {
   app.addHook('onResponse', async (req, reply) => {
     const seen = observed.get(req.id);
     observed.delete(req.id);
+    // Release the drain slot exactly once, whatever path completed the request.
+    if (lifecycle && inFlight.delete(req.id)) lifecycle.endWork();
     const route = req.routeOptions.url ?? 'unmatched';
     const durationNs = seen ? Number(process.hrtime.bigint() - seen.startedAt) : 0;
     const durationMs = Math.round(durationNs / 1e6);
@@ -288,7 +334,20 @@ export function buildApi(options: ApiOptions): FastifyInstance {
     return reply.status(204).send();
   });
 
-  app.get('/health', async () => ({ status: 'ok' }));
+  /**
+   * Liveness.
+   *
+   * Deliberately NOT readiness: a draining process is still alive and must keep saying so, or an
+   * orchestrator would kill it mid-request instead of letting it finish. It reports `stopping` while
+   * draining — informative without ever becoming the signal to terminate — and only a stopped process
+   * fails liveness.
+   */
+  app.get('/health', async (_req, reply) => {
+    if (!lifecycle) return { status: 'ok', state: 'running' };
+    const state = lifecycle.current();
+    if (!lifecycle.live()) return reply.status(503).send({ status: 'stopped', state });
+    return { status: 'ok', state: state === 'draining' ? 'stopping' : state };
+  });
 
   /**
    * Prometheus metrics.
@@ -305,6 +364,16 @@ export function buildApi(options: ApiOptions): FastifyInstance {
     reply.type('text/plain; version=0.0.4; charset=utf-8').send(metrics.render()),
   );
   app.get('/ready', async (_req, reply) => {
+    /**
+     * Draining fails readiness IMMEDIATELY and without touching the database.
+     *
+     * Checked before the dependency probe on purpose: the answer during a drain is already decided, and
+     * a probe that first waited on a query would widen exactly the window in which a load balancer can
+     * still route new work into a process that is shutting down.
+     */
+    if (lifecycle && !lifecycle.ready()) {
+      return reply.status(503).send({ status: 'draining', state: lifecycle.current(), checks: [] });
+    }
     /**
      * Readiness is more than "the pool can reach a database".
      *
